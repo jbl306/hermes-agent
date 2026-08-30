@@ -50,6 +50,7 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/auth/login",
     "/auth/callback",
     "/auth/native/authorize",
+    "/auth/native/app-callback",
     "/auth/native/token",
     "/auth/native/refresh",
     "/auth/password-login",
@@ -74,14 +75,14 @@ def _path_is_public(path: str) -> bool:
       the legacy ``_SESSION_TOKEN`` middleware also honours. Matched
       exactly (no prefix expansion) so adding ``/api/status`` doesn't
       accidentally expose ``/api/status/secret-extension``.
-    * :data:`_GATE_PUBLIC_PREFIXES` — auth-bootstrap routes and static
-      mounts. Prefix-matched so ``/assets/foo.css`` lights up via
-      ``/assets/``.
+    * :data:`_GATE_PUBLIC_PREFIXES` — exact auth-bootstrap routes plus static
+      mounts. Only entries ending in ``/`` prefix-match descendants, so
+      ``/assets/foo.css`` lights up without exposing suffixed auth paths.
     """
     if path in PUBLIC_API_PATHS:
         return True
     return any(
-        path == prefix or path.startswith(prefix)
+        path == prefix or (prefix.endswith("/") and path.startswith(prefix))
         for prefix in _GATE_PUBLIC_PREFIXES
     )
 

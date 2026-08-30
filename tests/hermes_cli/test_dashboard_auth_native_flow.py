@@ -1,5 +1,4 @@
-"""E2E + unit tests for the RFC 8252 native-app (system-browser + loopback +
-PKCE) dashboard-auth flow.
+"""E2E + unit tests for RFC 8252 native-app system-browser + PKCE flows.
 
 Covers:
   * ``native_flow`` broker unit behaviour — PKCE binding, single-use codes,
@@ -191,7 +190,7 @@ def _walk_native_login(client, *, redirect_uri, challenge, state="cli-state"):
 
 
 
-def test_native_authorize_rejects_non_loopback_redirect(gated_client):
+def test_native_authorize_rejects_untrusted_redirect(gated_client):
     _verifier, challenge = _make_pkce()
     r = gated_client.get(
         "/auth/native/authorize",
@@ -204,7 +203,173 @@ def test_native_authorize_rejects_non_loopback_redirect(gated_client):
         },
     )
     assert r.status_code == 400
-    assert "loopback" in r.json()["detail"].lower()
+    assert "native redirect_uri" in r.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "https://evil.example.com/auth/native/app-callback",
+        "https://fly-app.fly.dev/other",
+        "https://fly-app.fly.dev:444/auth/native/app-callback",
+        "https://user@fly-app.fly.dev/auth/native/app-callback",
+        "https://fly-app.fly.dev/auth/native/app-callback#fragment",
+        "http://fly-app.fly.dev/auth/native/app-callback",
+        "io.github.jbl306.hermescontroller:/auth/native/app-callback",
+    ],
+)
+def test_native_authorize_rejects_neighboring_app_redirects(
+    gated_client, redirect_uri,
+):
+    _verifier, challenge = _make_pkce()
+    r = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": redirect_uri,
+            "state": "s",
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_native_authorize_accepts_exact_configured_app_link(
+    gated_client, monkeypatch
+):
+    monkeypatch.setenv(
+        "HERMES_NATIVE_APP_REDIRECT_URI",
+        "https://fly-app.fly.dev/auth/native/app-callback",
+    )
+    _verifier, challenge = _make_pkce()
+    r = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": (
+                "https://fly-app.fly.dev/auth/native/app-callback"
+            ),
+            "state": "s",
+        },
+    )
+    assert r.status_code == 302, r.text
+
+
+def test_native_app_link_uses_explicit_config_not_request_or_admin_origin(
+    gated_client, monkeypatch
+):
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL", "https://hermes-native.example"
+    )
+    monkeypatch.setenv(
+        "HERMES_NATIVE_APP_REDIRECT_URI",
+        "https://configured-controller.example/auth/native/app-callback",
+    )
+    _verifier, challenge = _make_pkce()
+    r = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": (
+                "https://configured-controller.example/auth/native/app-callback"
+            ),
+            "state": "configured-origin-state",
+        },
+    )
+    assert r.status_code == 302, r.text
+
+
+def test_native_app_link_is_disabled_without_explicit_config(
+    gated_client, monkeypatch
+):
+    monkeypatch.delenv("HERMES_NATIVE_APP_REDIRECT_URI", raising=False)
+    _verifier, challenge = _make_pkce()
+    r = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": (
+                "https://fly-app.fly.dev/auth/native/app-callback"
+            ),
+            "state": "disabled-state",
+        },
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "https://controller.example:not-a-port/auth/native/app-callback",
+        "https://bad host.example/auth/native/app-callback",
+        " https://controller.example/auth/native/app-callback ",
+        "https://bad\thost.example/auth/native/app-callback",
+        "https://bad\u200bhost.example/auth/native/app-callback",
+        "https://controller.example:/auth/native/app-callback",
+        "https://controller.example/auth/native/app-callback?",
+        "https://controller.example/auth/native/app-callback#",
+        "https://controller.example/auth/native/app-callback;",
+    ],
+)
+def test_native_app_link_malformed_config_fails_closed(
+    gated_client, monkeypatch, configured
+):
+    monkeypatch.setenv("HERMES_NATIVE_APP_REDIRECT_URI", configured)
+    _verifier, challenge = _make_pkce()
+    r = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": (
+                "https://fly-app.fly.dev/auth/native/app-callback"
+            ),
+            "state": "malformed-config-state",
+        },
+    )
+    assert r.status_code == 500
+    assert r.json()["detail"] == "invalid native app redirect configuration"
+
+
+def test_native_app_link_malformed_config_also_blocks_loopback(
+    gated_client, monkeypatch
+):
+    monkeypatch.setenv(
+        "HERMES_NATIVE_APP_REDIRECT_URI",
+        "https://controller.example/auth/native/app-callback?",
+    )
+    _verifier, challenge = _make_pkce()
+    r = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": "http://127.0.0.1:53999/cb",
+            "state": "malformed-config-loopback-state",
+        },
+    )
+    assert r.status_code == 500
+    assert r.json()["detail"] == "invalid native app redirect configuration"
+
+
+def test_native_app_callback_fallback_is_secret_free_and_not_cached(gated_client):
+    r = gated_client.get(
+        "/auth/native/app-callback",
+        params={"code": "do-not-render", "state": "do-not-render"},
+    )
+    assert r.status_code == 200
+    assert "do-not-render" not in r.text
+    assert r.headers["cache-control"] == "no-store"
+    assert r.headers["referrer-policy"] == "no-referrer"
 
 
 # ---------------------------------------------------------------------------
