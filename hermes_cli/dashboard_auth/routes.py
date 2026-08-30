@@ -22,7 +22,7 @@ from collections import defaultdict, deque
 from typing import Any, Deque, Dict
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 
 from hermes_cli.dashboard_auth import (
@@ -250,17 +250,55 @@ async def auth_login(request: Request, provider: str, next: str = ""):
 # ---------------------------------------------------------------------------
 
 
-def _validate_loopback_redirect_uri(raw: str) -> str:
-    """Return ``raw`` if it is a safe loopback redirect_uri, else raise.
+def _native_app_redirect_uri() -> str:
+    """Return the one explicitly configured claimed-HTTPS callback, if any."""
+    import os
+    from urllib.parse import urlsplit, urlunsplit
 
-    RFC 8252 §7.3 restricts native-app redirects to the loopback interface.
-    We accept only ``http://127.0.0.1[:port]/...`` and ``http://[::1][:port]/...``
-    — literal loopback IPs. ``localhost`` is deliberately NOT accepted
+    raw = os.environ.get("HERMES_NATIVE_APP_REDIRECT_URI", "")
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        parsed.port
+    except (UnicodeError, ValueError):
+        parsed = None
+    hostname = parsed.hostname if parsed is not None else ""
+    if (
+        parsed is None
+        or not raw.isascii()
+        or raw != raw.strip()
+        or any(ch.isspace() or ord(ch) < 33 or ord(ch) == 127 for ch in raw)
+        or parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.netloc.endswith(":")
+        or parsed.path != "/auth/native/app-callback"
+        or parsed.query
+        or parsed.fragment
+        or urlunsplit(parsed) != raw
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="invalid native app redirect configuration",
+        )
+    return raw
+
+
+def _validate_native_redirect_uri(raw: str) -> str:
+    """Accept literal loopback or the exact configured native App Link.
+
+    RFC 8252 permits claimed HTTPS redirects for native apps (§7.2) and
+    loopback redirects (§7.3). Claimed HTTPS is admitted only for the exact
+    configured callback URI. Loopback accepts
+    only ``http://127.0.0.1[:port]/...`` and ``http://[::1][:port]/...`` —
+    literal loopback IPs. ``localhost`` is deliberately NOT accepted
     (RFC 8252 §8.3: the name can resolve to a non-loopback address via the
     hosts file or a hostile resolver, so clients "SHOULD use loopback IP
     literals"; the desktop always sends ``127.0.0.1``).
-    A non-loopback host would let an attacker who can reach ``/auth/native/
-    authorize`` (a public route) turn the gateway's authenticated callback
+    Any other non-loopback host would let an attacker who can reach
+    ``/auth/native/authorize`` (a public route) turn the authenticated callback
     into an open redirect that leaks a live authorization code to an
     arbitrary origin — so this check is a security boundary, not ergonomics.
     """
@@ -268,22 +306,33 @@ def _validate_loopback_redirect_uri(raw: str) -> str:
 
     if not raw:
         raise HTTPException(status_code=400, detail="redirect_uri required")
+    native_app_redirect = _native_app_redirect_uri()
     parsed = urlparse(raw)
-    if parsed.scheme != "http":
-        raise HTTPException(
-            status_code=400,
-            detail="native redirect_uri must be http:// on the loopback interface",
-        )
     host = (parsed.hostname or "").lower()
-    if host not in ("127.0.0.1", "::1"):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "native redirect_uri host must be a loopback IP literal "
-                "(127.0.0.1 / ::1)"
-            ),
-        )
-    return raw
+    if parsed.scheme == "http" and host in ("127.0.0.1", "::1"):
+        return raw
+    if native_app_redirect and raw == native_app_redirect:
+        return raw
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "native redirect_uri must be a loopback IP literal or the exact "
+            "same-origin native app callback"
+        ),
+    )
+
+
+@router.get("/auth/native/app-callback", name="auth_native_app_callback")
+async def auth_native_app_callback() -> PlainTextResponse:
+    """Safe fallback when the operating system does not claim the App Link."""
+    return PlainTextResponse(
+        "Authentication callback was not claimed by the native app.",
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/auth/native/authorize", name="auth_native_authorize")
@@ -322,7 +371,7 @@ async def auth_native_authorize(
         )
     if not code_challenge:
         raise HTTPException(status_code=400, detail="code_challenge required")
-    _validate_loopback_redirect_uri(redirect_uri)
+    _validate_native_redirect_uri(redirect_uri)
 
     # Resolve the provider. With exactly one brokerable session provider
     # registered (the common hosted case) an empty ``provider`` selects it,

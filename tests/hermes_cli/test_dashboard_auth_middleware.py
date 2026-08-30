@@ -14,11 +14,11 @@ without any external IDP.  Exercises:
 """
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
 import pytest
 
-from fastapi.testclient import TestClient
-
 from hermes_cli import web_server
+from hermes_cli.dashboard_auth.middleware import _path_is_public
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
@@ -48,6 +48,12 @@ def gated_app():
 # ---------------------------------------------------------------------------
 # Allowlist (public) routes
 # ---------------------------------------------------------------------------
+
+
+def test_named_auth_routes_are_exact_while_asset_mounts_use_prefixes():
+    assert _path_is_public("/auth/native/app-callback")
+    assert not _path_is_public("/auth/native/app-callback-extra")
+    assert _path_is_public("/assets/app.js")
 
 
 def test_gated_status_is_public(gated_app):
